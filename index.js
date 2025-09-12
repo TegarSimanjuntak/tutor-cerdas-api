@@ -143,6 +143,48 @@ app.post('/chat/ask', async (req, res) => {
     sources: []
   });
 });
+// List chunks per dokumen (pagination optional)
+app.get('/documents/:id/chunks', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const limit = Number(req.query.limit ?? 50);
+    const offset = Number(req.query.offset ?? 0);
+
+    const q = supabase
+      .from('chunks')
+      .select('*', { count: 'exact' })
+      .eq('document_id', id)
+      .order('chunk_index', { ascending: true })
+      .range(offset, offset + limit - 1);
+
+    const { data, error, count } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ items: data || [], count: count ?? 0, limit, offset });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// (Opsional) gabungkan beberapa chunk jadi teks pratinjau
+app.get('/documents/:id/preview', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const n = Number(req.query.n ?? 10); // gabungkan N chunk pertama
+    const { data, error } = await supabase
+      .from('chunks')
+      .select('chunk_index, content')
+      .eq('document_id', id)
+      .order('chunk_index', { ascending: true })
+      .limit(n);
+    if (error) return res.status(500).json({ error: error.message });
+    const text = (data || []).map(x => x.content).join('\n\n---\n\n');
+    res.type('text/plain').send(text);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 
 // Start server
 const PORT = process.env.PORT || 8787;
