@@ -2,35 +2,43 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const pdfParse = require('pdf-parse');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-// --- CORS (boleh longgar dulu). Untuk produksi, ganti origin ke process.env.WEB_ORIGIN
-app.use(cors());
+/* ===== CORS ===== */
+const allowed = process.env.WEB_ORIGIN
+  ? process.env.WEB_ORIGIN.split(',').map(s => s.trim())
+  : true; // longgar saat dev
+app.use(cors({ origin: allowed, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 
-// ------ Supabase client (server-side pakai service key) ------
+/* ===== Supabase ===== */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY,
   { auth: { persistSession: false } }
 );
 
-// ------ Konfigurasi Storage & Table ------
+/* ===== Konfigurasi ===== */
 const BUCKET = 'documents';
 const TABLE  = 'documents';
+const INDEXER_URL = process.env.INDEXER_URL; // ex: https://tutor-cerdas-indexer.up.railway.app
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 30 * 1024 * 1024 } // 30MB
+});
 
-const upload = multer({ storage: multer.memoryStorage() });
+/* ===== Util fetch (Node 18 sudah ada fetch) ===== */
+const _fetch = (...args) =>
+  (global.fetch ? global.fetch(...args) : import('node-fetch').then(({ default: f }) => f(...args)));
 
-// Health check
-app.get('/health', (req, res) => {
+/* ===== Health ===== */
+app.get('/health', (_req, res) => {
   res.json({ ok: true, env: process.env.NODE_ENV || 'dev' });
 });
 
-// === M2.1 Upload PDF ===
-// multipart form: field "file" (required), "title" (optional)
+/* ===== Upload PDF ===== */
 app.post('/documents/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'file is required' });
@@ -43,7 +51,6 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
     const rand = Math.random().toString(36).slice(2, 10);
     const storage_path = `${y}/${m}/${rand}.${ext}`;
 
-    // Upload ke Supabase Storage (bucket: documents)
     const { error: upErr } = await supabase
       .storage.from(BUCKET)
       .upload(storage_path, req.file.buffer, {
@@ -52,7 +59,6 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
       });
     if (upErr) return res.status(500).json({ error: upErr.message });
 
-    // Simpan metadata ke table documents
     const { data, error: insErr } = await supabase
       .from(TABLE)
       .insert({ title, storage_path, size: req.file.size, status: 'uploaded' })
@@ -66,7 +72,7 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// === M2.2 List documents (terbaru dulu) ===
+/* ===== List Documents ===== */
 app.get('/documents', async (_req, res) => {
   try {
     const { data, error } = await supabase
@@ -81,69 +87,30 @@ app.get('/documents', async (_req, res) => {
   }
 });
 
-// === M2.3 Rebuild: download PDF -> extract text -> chunk -> simpan ke "chunks" ===
+/* ===== Rebuild = proxy ke INDEXER (chunk + embed) ===== */
 app.post('/documents/rebuild/:id', async (req, res) => {
   try {
-    const id = req.params.id;
+    if (!INDEXER_URL) return res.status(500).json({ error: 'INDEXER_URL not set' });
 
-    // Ambil dokumen
-    const { data: doc, error: e1 } = await supabase
-      .from(TABLE).select('*').eq('id', id).single();
-    if (e1) return res.status(404).json({ error: 'document not found' });
+    // optional: pastikan dokumen ada
+    const { data: doc, error } = await supabase
+      .from(TABLE).select('id').eq('id', req.params.id).single();
+    if (error || !doc) return res.status(404).json({ error: 'document not found' });
 
-    const path = doc.storage_path || doc.file_path; // fallback bila kamu masih punya kolom file_path
-    if (!path) return res.status(400).json({ error: 'no storage_path' });
+    const r = await _fetch(`${INDEXER_URL}/process/document`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ document_id: req.params.id })
+    });
 
-    // Download dari Storage
-    const { data: file, error: e2 } = await supabase
-      .storage.from(BUCKET).download(path);
-    if (e2) return res.status(500).json({ error: e2.message });
-
-    const buf = Buffer.from(await file.arrayBuffer());
-    const parsed = await pdfParse(buf);
-    const text = parsed.text || '';
-
-    // Simple chunking 800 chars
-    const CHUNK = 800;
-    const parts = [];
-    for (let i = 0; i < text.length; i += CHUNK) {
-      parts.push(text.slice(i, i + CHUNK));
-    }
-
-    // Hapus chunks lama (opsional)
-    await supabase.from('chunks').delete().eq('document_id', id);
-
-    // Insert chunks baru
-    if (parts.length) {
-      const rows = parts.map((t, idx) => ({
-        document_id: id,
-        chunk_index: idx,
-        content: t
-      }));
-      const { error: e3 } = await supabase.from('chunks').insert(rows);
-      if (e3) return res.status(500).json({ error: e3.message });
-    }
-
-    // Update status & pages
-    await supabase.from(TABLE)
-      .update({ status: 'indexed', pages: parsed.numpages || null })
-      .eq('id', id);
-
-    res.json({ ok: true, pages: parsed.numpages || 0, chunks: parts.length });
+    const j = await r.json().catch(() => ({}));
+    return res.status(r.ok ? 200 : 502).json(j);
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
 
-// --- (M4 nanti gantikan /chat/ask dengan RAG) ---
-app.post('/chat/ask', async (req, res) => {
-  const { question, role } = req.body || {};
-  res.json({
-    answer: `Halo (${role || 'user'})! Kamu bertanya: "${question}". Jawaban asli akan muncul setelah RAG di M4.`,
-    sources: []
-  });
-});
-// List chunks per dokumen (pagination optional)
+/* ===== Lihat chunks per dokumen ===== */
 app.get('/documents/:id/chunks', async (req, res) => {
   try {
     const id = req.params.id;
@@ -166,11 +133,11 @@ app.get('/documents/:id/chunks', async (req, res) => {
   }
 });
 
-// (Opsional) gabungkan beberapa chunk jadi teks pratinjau
+/* ===== Preview gabungan N chunk pertama ===== */
 app.get('/documents/:id/preview', async (req, res) => {
   try {
     const id = req.params.id;
-    const n = Number(req.query.n ?? 10); // gabungkan N chunk pertama
+    const n = Number(req.query.n ?? 10);
     const { data, error } = await supabase
       .from('chunks')
       .select('chunk_index, content')
@@ -185,8 +152,16 @@ app.get('/documents/:id/preview', async (req, res) => {
   }
 });
 
+/* ===== Placeholder chat (M4) ===== */
+app.post('/chat/ask', async (req, res) => {
+  const { question, role } = req.body || {};
+  res.json({
+    answer: `Halo (${role || 'user'})! Kamu bertanya: "${question}". Jawaban asli akan muncul setelah RAG di M4.`,
+    sources: []
+  });
+});
 
-// Start server
+/* ===== Start ===== */
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, '0.0.0.0', () => {
   console.log('API running on http://localhost:' + PORT);
