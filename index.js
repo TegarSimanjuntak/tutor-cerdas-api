@@ -109,22 +109,36 @@ app.post('/documents/rebuild/:id', async (req, res) => {
   try {
     if (!INDEXER_URL) return res.status(500).json({ error: 'INDEXER_URL not set' });
 
+    // pastikan dokumen ada
     const { data: doc, error } = await supabase
       .from(TABLE).select('id').eq('id', req.params.id).single();
     if (error || !doc) return res.status(404).json({ error: 'document not found' });
 
-    const r = await _fetch(`${INDEXER_URL}/process/document`, {
+    // panggil indexer
+    let r = await _fetch(`${INDEXER_URL}/process/document`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ document_id: req.params.id })
     });
 
-    const j = await r.json().catch(() => ({}));
-    return res.status(r.ok ? 200 : 502).json(j);
+    // kalau kamu sempat pakai versi lama, fallback ke /embed/document
+    if (r.status === 404) {
+      r = await _fetch(`${INDEXER_URL}/embed/document`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ document_id: req.params.id })
+      });
+    }
+
+    const txt = await r.text();
+    let body; try { body = JSON.parse(txt) } catch { body = { raw: txt } }
+    console.log('[rebuild] upstream status:', r.status, body);
+    return res.status(r.status).json(body);
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
+
 
 /* ===== Lihat chunks per dokumen ===== */
 app.get('/documents/:id/chunks', async (req, res) => {
