@@ -6,11 +6,21 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-/* ===== CORS ===== */
-const allowed = process.env.WEB_ORIGIN
+/* ===== CORS (whitelist dari ENV, +preflight OPTIONS) ===== */
+const allowedOrigins = process.env.WEB_ORIGIN
   ? process.env.WEB_ORIGIN.split(',').map(s => s.trim())
-  : true; // longgar saat dev
-app.use(cors({ origin: allowed, credentials: true }));
+  : true; // dev: reflect any origin
+
+const corsOptions = {
+  origin: allowedOrigins,
+  credentials: true, // kalau tidak pakai cookie, boleh set false
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // penting untuk preflight
 app.use(express.json({ limit: '10mb' }));
 
 /* ===== Supabase ===== */
@@ -72,14 +82,21 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-/* ===== List Documents ===== */
+/* ===== List Documents (fallback jika 'created_at' tidak ada) ===== */
 app.get('/documents', async (_req, res) => {
   try {
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from(TABLE)
       .select('*')
       .order('created_at', { ascending: false })
       .limit(50);
+
+    if (error && /created_at/i.test(error.message)) {
+      // Kolom 'created_at' tidak ada → fallback tanpa order
+      const resp = await supabase.from(TABLE).select('*').limit(50);
+      data = resp.data; error = resp.error;
+    }
+
     if (error) return res.status(500).json({ error: error.message });
     res.json({ items: data || [] });
   } catch (e) {
@@ -92,7 +109,6 @@ app.post('/documents/rebuild/:id', async (req, res) => {
   try {
     if (!INDEXER_URL) return res.status(500).json({ error: 'INDEXER_URL not set' });
 
-    // optional: pastikan dokumen ada
     const { data: doc, error } = await supabase
       .from(TABLE).select('id').eq('id', req.params.id).single();
     if (error || !doc) return res.status(404).json({ error: 'document not found' });
