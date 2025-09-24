@@ -105,6 +105,32 @@ app.get('/documents', async (_req, res) => {
   }
 });
 
+/* ===== Hapus Dokumen (storage + chunks + row dokumen) ===== */
+app.delete('/documents/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { data: doc, error: e1 } = await supabase
+      .from(TABLE).select('id, storage_path').eq('id', id).single();
+    if (e1 || !doc) return res.status(404).json({ error: 'document not found' });
+
+    if (doc.storage_path) {
+      const { error: eS } = await supabase.storage.from(BUCKET).remove([doc.storage_path]);
+      if (eS) console.warn('[delete] storage remove warn:', eS.message);
+    }
+
+    const { error: e2 } = await supabase.from('chunks').delete().eq('document_id', id);
+    if (e2) return res.status(500).json({ error: e2.message });
+
+    const { error: e3 } = await supabase.from(TABLE).delete().eq('id', id);
+    if (e3) return res.status(500).json({ error: e3.message });
+
+    res.json({ ok: true, deleted: id });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 /* ===== Rebuild = proxy ke INDEXER (chunk + embed) ===== */
 app.post('/documents/rebuild/:id', async (req, res) => {
   try {
@@ -201,16 +227,43 @@ app.post('/chat/ask', async (req, res) => {
     }
     const contexts = search.items || [];
 
-    // Susun teks sumber untuk prompt
+    // perkaya dengan judul dokumen + snippet pendek
+    const ids = Array.from(new Set(contexts.map(c => c.document_id)));
+    const titles = {};
+    if (ids.length) {
+      const { data: rows } = await supabase
+        .from(TABLE)
+        .select('id,title,storage_path')
+        .in('id', ids);
+      for (const row of (rows || [])) {
+        titles[row.id] = row.title || row.storage_path || '(untitled)';
+      }
+    }
+
+    const sources = contexts.map((c, i) => {
+      const title = titles[c.document_id] || c.document_id;
+      const preview = (c.content || '').replace(/\s+/g, ' ').slice(0, 120);
+      return {
+        id: `${c.document_id}:${c.chunk_index}`,
+        index: i + 1,
+        document_id: c.document_id,
+        chunk_index: c.chunk_index,
+        similarity: c.similarity,
+        title,
+        preview
+      };
+    });
+
+    // Susun teks sumber untuk prompt (pakai konten apa adanya)
     const sourcesText = contexts.map((c, i) =>
       `[${i + 1}] (doc:${c.document_id} #${c.chunk_index})\n${c.content}`
     ).join('\n\n---\n\n');
 
-    // 2) Kalau belum set GEMINI_API_KEY → fallback (kembalikan konteks saja)
+    // 2) Kalau belum set GEMINI_API_KEY → fallback (kembalikan konteks enriched)
     if (!process.env.GEMINI_API_KEY) {
       return res.json({
         answer: 'GEMINI_API_KEY belum di-set. Berikut konteks terdekat.',
-        sources: contexts
+        sources
       });
     }
 
@@ -231,17 +284,8 @@ app.post('/chat/ask', async (req, res) => {
     const resp = await model.generateContent(prompt);
     const text = resp?.response?.text?.() || 'Tidak ditemukan di materi.';
 
-    // 4) Response berisi jawaban + sumber
-    res.json({
-      answer: text,
-      sources: contexts.map((c, i) => ({
-        id: `${c.document_id}:${c.chunk_index}`,
-        index: i + 1,
-        document_id: c.document_id,
-        chunk_index: c.chunk_index,
-        similarity: c.similarity
-      }))
-    });
+    // 4) Response berisi jawaban + sumber (judul + snippet)
+    res.json({ answer: text, sources });
   } catch (e) {
     console.error('[chat/ask] error', e);
     res.status(500).json({ error: String(e) });
