@@ -5,56 +5,104 @@ const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+/* ==========================================
+ *  Basic App & Config
+ * ========================================== */
 const app = express();
 
-/* ===== CORS (whitelist dari ENV, +preflight OPTIONS) ===== */
+// ---- CORS (whitelist dari ENV, + preflight OPTIONS)
 const allowedOrigins = process.env.WEB_ORIGIN
   ? process.env.WEB_ORIGIN.split(',').map(s => s.trim())
-  : true; // dev: reflect any origin
+  : true; // dev: allow all
 
 const corsOptions = {
   origin: allowedOrigins,
   credentials: true,
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  maxAge: 86400
+  maxAge: 86400,
 };
-
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // penting untuk preflight
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 
-/* ===== Supabase ===== */
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
-  { auth: { persistSession: false } }
-);
+// ---- Supabase client (gunakan SERVICE KEY di backend)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  // Jangan crash; tapi beri warning jelas di log
+  console.warn('[startup] SUPABASE_URL / SUPABASE_SERVICE_KEY belum di-set.');
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+  auth: { persistSession: false },
+});
 
-/* ===== Konfigurasi ===== */
+// ---- Konstanta
 const BUCKET = 'documents';
 const TABLE  = 'documents';
 const INDEXER_URL = process.env.INDEXER_URL; // ex: https://<indexer>.up.railway.app
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+
+// ---- Upload config (30MB)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 30 * 1024 * 1024 } // 30MB
+  limits: { fileSize: 30 * 1024 * 1024 },
 });
 
-/* ===== Util fetch (Node 18 sudah ada fetch) ===== */
-const _fetch = (...args) =>
-  (global.fetch ? global.fetch(...args) : import('node-fetch').then(({ default: f }) => f(...args)));
+// ---- util fetch (Node18 punya fetch)
+const _fetch = (...args) => (
+  global.fetch ? global.fetch(...args) : import('node-fetch').then(({ default: f }) => f(...args))
+);
 
-/* ===== Health ===== */
+/* ==========================================
+ *  Helpers
+ * ========================================== */
+const clampInt = (v, min, max, def) => {
+  const n = Number.parseInt(v ?? def, 10);
+  if (Number.isNaN(n)) return def;
+  return Math.min(Math.max(n, min), max);
+};
+
+const jsonOk = (res, obj = {}) => res.json({ ok: true, ...obj });
+const jsonErr = (res, code, msg, extra) => res.status(code).json({ error: msg, ...(extra || {}) });
+
+async function getDocumentById(id, columns = 'id, title, storage_path, size, status, created_at') {
+  const { data, error } = await supabase.from(TABLE).select(columns).eq('id', id).single();
+  if (error || !data) return { error: error || new Error('document not found') };
+  return { data };
+}
+
+/* ==========================================
+ *  Health & Meta
+ * ========================================== */
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, env: process.env.NODE_ENV || 'dev' });
+  res.json({
+    ok: true,
+    env: process.env.NODE_ENV || 'dev',
+    indexer: !!INDEXER_URL,
+    supabase: !!(SUPABASE_URL && SUPABASE_SERVICE_KEY),
+    model: GEMINI_MODEL,
+    ts: new Date().toISOString(),
+  });
 });
 
-/* ===== Upload PDF ===== */
+app.head('/', (_req, res) => res.status(204).end());
+
+/* ==========================================
+ *  Documents: Upload / List / Get / Signed URL / Delete / Preview / Chunks / Rebuild
+ * ========================================== */
+
+// ---- Upload PDF
 app.post('/documents/upload', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'file is required' });
+    if (!req.file) return jsonErr(res, 400, 'file is required');
+
     const title = req.body?.title || req.file.originalname;
+    // Pastikan PDF (opsional: longgarkan jika perlu)
+    if (req.file.mimetype && !/pdf/i.test(req.file.mimetype)) {
+      return jsonErr(res, 400, 'only PDF is supported');
+    }
+
     const ext = (req.file.originalname.split('.').pop() || 'pdf').toLowerCase();
 
     const now = new Date();
@@ -67,24 +115,24 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
       .storage.from(BUCKET)
       .upload(storage_path, req.file.buffer, {
         contentType: req.file.mimetype || 'application/pdf',
-        upsert: false
+        upsert: false,
       });
-    if (upErr) return res.status(500).json({ error: upErr.message });
+    if (upErr) return jsonErr(res, 500, upErr.message);
 
     const { data, error: insErr } = await supabase
       .from(TABLE)
       .insert({ title, storage_path, size: req.file.size, status: 'uploaded' })
       .select()
       .single();
-    if (insErr) return res.status(500).json({ error: insErr.message });
+    if (insErr) return jsonErr(res, 500, insErr.message);
 
-    res.json({ ok: true, document: data });
+    return jsonOk(res, { document: data });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    return jsonErr(res, 500, String(e));
   }
 });
 
-/* ===== List Documents (fallback jika 'created_at' tidak ada) ===== */
+// ---- List Documents
 app.get('/documents', async (_req, res) => {
   try {
     let { data, error } = await supabase
@@ -93,26 +141,68 @@ app.get('/documents', async (_req, res) => {
       .order('created_at', { ascending: false })
       .limit(50);
 
+    // fallback jika kolom created_at belum ada
     if (error && /created_at/i.test(error.message)) {
       const resp = await supabase.from(TABLE).select('*').limit(50);
       data = resp.data; error = resp.error;
     }
 
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ items: data || [] });
+    if (error) return jsonErr(res, 500, error.message);
+    return res.json({ items: data || [] });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    return jsonErr(res, 500, String(e));
   }
 });
 
-/* ===== Hapus Dokumen (storage + chunks + row dokumen) ===== */
+// ---- Get single document (metadata)
+app.get('/documents/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from(TABLE).select('id, title, storage_path, size, status, created_at')
+      .eq('id', req.params.id)
+      .single();
+    if (error || !data) return jsonErr(res, 404, 'document not found');
+    return jsonOk(res, { document: data });
+  } catch (e) {
+    return jsonErr(res, 500, String(e));
+  }
+});
+
+// ---- Signed URL (open PDF)
+app.get('/documents/:id/url', async (req, res) => {
+  try {
+    const { data: doc, error } = await supabase
+      .from(TABLE).select('id, storage_path, title')
+      .eq('id', req.params.id)
+      .single();
+    if (error || !doc) return jsonErr(res, 404, 'document not found');
+    if (!doc.storage_path) return jsonErr(res, 400, 'no storage_path');
+
+    // Coba signed URL (bucket private)
+    const { data, error: e2 } = await supabase
+      .storage.from(BUCKET)
+      .createSignedUrl(doc.storage_path, 3600); // 1 jam
+
+    if (!e2 && data?.signedUrl) {
+      return jsonOk(res, { url: data.signedUrl, title: doc.title, storage_path: doc.storage_path });
+    }
+
+    // Fallback: jika bucket public
+    const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${doc.storage_path}`;
+    return jsonOk(res, { url: publicUrl, title: doc.title, storage_path: doc.storage_path, public: true });
+  } catch (e) {
+    return jsonErr(res, 500, String(e));
+  }
+});
+
+// ---- Delete document (storage + chunks + row dokumen)
 app.delete('/documents/:id', async (req, res) => {
   try {
     const id = req.params.id;
 
     const { data: doc, error: e1 } = await supabase
       .from(TABLE).select('id, storage_path').eq('id', id).single();
-    if (e1 || !doc) return res.status(404).json({ error: 'document not found' });
+    if (e1 || !doc) return jsonErr(res, 404, 'document not found');
 
     if (doc.storage_path) {
       const { error: eS } = await supabase.storage.from(BUCKET).remove([doc.storage_path]);
@@ -120,58 +210,23 @@ app.delete('/documents/:id', async (req, res) => {
     }
 
     const { error: e2 } = await supabase.from('chunks').delete().eq('document_id', id);
-    if (e2) return res.status(500).json({ error: e2.message });
+    if (e2) return jsonErr(res, 500, e2.message);
 
     const { error: e3 } = await supabase.from(TABLE).delete().eq('id', id);
-    if (e3) return res.status(500).json({ error: e3.message });
+    if (e3) return jsonErr(res, 500, e3.message);
 
-    res.json({ ok: true, deleted: id });
+    return jsonOk(res, { deleted: id });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    return jsonErr(res, 500, String(e));
   }
 });
 
-/* ===== Rebuild = proxy ke INDEXER (chunk + embed) ===== */
-app.post('/documents/rebuild/:id', async (req, res) => {
-  try {
-    if (!INDEXER_URL) return res.status(500).json({ error: 'INDEXER_URL not set' });
-
-    const { data: doc, error } = await supabase
-      .from(TABLE).select('id, storage_path').eq('id', req.params.id).single();
-    if (error || !doc) return res.status(404).json({ error: 'document not found' });
-    if (!doc.storage_path) return res.status(400).json({ error: 'no storage_path; re-upload file' });
-
-    // coba endpoint baru
-    let r = await _fetch(`${INDEXER_URL}/process/document`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ document_id: req.params.id })
-    });
-    // fallback ke endpoint lama kalau 404
-    if (r.status === 404) {
-      r = await _fetch(`${INDEXER_URL}/embed/document`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ document_id: req.params.id })
-      });
-    }
-
-    const txt = await r.text();
-    let body; try { body = JSON.parse(txt) } catch { body = { raw: txt } }
-    console.log('[rebuild] upstream status:', r.status, 'body:', body);
-    return res.status(r.status).json(body);
-  } catch (e) {
-    console.error('[rebuild] error:', e);
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-/* ===== Lihat chunks per dokumen ===== */
+// ---- Chunks per document
 app.get('/documents/:id/chunks', async (req, res) => {
   try {
     const id = req.params.id;
-    const limit = Number(req.query.limit ?? 50);
-    const offset = Number(req.query.offset ?? 0);
+    const limit = clampInt(req.query.limit, 1, 1000, 50);
+    const offset = clampInt(req.query.offset, 0, 1e6, 0);
 
     const q = supabase
       .from('chunks')
@@ -181,59 +236,99 @@ app.get('/documents/:id/chunks', async (req, res) => {
       .range(offset, offset + limit - 1);
 
     const { data, error, count } = await q;
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return jsonErr(res, 500, error.message);
 
-    res.json({ items: data || [], count: count ?? 0, limit, offset });
+    return res.json({ items: data || [], count: count ?? 0, limit, offset });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    return jsonErr(res, 500, String(e));
   }
 });
 
-/* ===== Preview gabungan N chunk pertama ===== */
+// ---- Preview gabungan N chunk pertama (teks)
 app.get('/documents/:id/preview', async (req, res) => {
   try {
     const id = req.params.id;
-    const n = Number(req.query.n ?? 10);
+    const n = clampInt(req.query.n, 1, 100, 10);
     const { data, error } = await supabase
       .from('chunks')
       .select('chunk_index, content')
       .eq('document_id', id)
       .order('chunk_index', { ascending: true })
       .limit(n);
-    if (error) return res.status(500).json({ error: error.message });
+
+    if (error) return jsonErr(res, 500, error.message);
     const text = (data || []).map(x => x.content).join('\n\n---\n\n');
-    res.type('text/plain').send(text);
+    return res.type('text/plain').send(text);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    return jsonErr(res, 500, String(e));
   }
 });
 
-/* ===== M4: RAG (retrieval -> Gemini) ===== */
+// ---- Rebuild (proxy ke INDEXER: chunk + embed)
+app.post('/documents/rebuild/:id', async (req, res) => {
+  try {
+    if (!INDEXER_URL) return jsonErr(res, 500, 'INDEXER_URL not set');
+
+    const { data: doc, error } = await supabase
+      .from(TABLE).select('id, storage_path').eq('id', req.params.id).single();
+    if (error || !doc) return jsonErr(res, 404, 'document not found');
+    if (!doc.storage_path) return jsonErr(res, 400, 'no storage_path; re-upload file');
+
+    // endpoint baru
+    let r = await _fetch(`${INDEXER_URL}/process/document`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ document_id: req.params.id }),
+    });
+    // fallback endpoint lama
+    if (r.status === 404) {
+      r = await _fetch(`${INDEXER_URL}/embed/document`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ document_id: req.params.id }),
+      });
+    }
+
+    const txt = await r.text();
+    let body; try { body = JSON.parse(txt) } catch { body = { raw: txt } }
+    console.log('[rebuild] upstream status:', r.status, 'body:', body);
+    return res.status(r.status).json(body);
+  } catch (e) {
+    console.error('[rebuild] error:', e);
+    return jsonErr(res, 500, String(e));
+  }
+});
+
+/* ==========================================
+ *  RAG: /chat/ask  (retrieval -> Gemini)
+ * ========================================== */
 app.post('/chat/ask', async (req, res) => {
   try {
     const { question, role, top_k } = req.body || {};
-    if (!question) return res.status(400).json({ error: 'question is required' });
-    if (!INDEXER_URL) return res.status(500).json({ error: 'INDEXER_URL not set' });
+    if (!question) return jsonErr(res, 400, 'question is required');
+    if (!INDEXER_URL) return jsonErr(res, 500, 'INDEXER_URL not set');
+
+    const k = clampInt(top_k, 1, 12, 6);
 
     // 1) Ambil konteks dari Indexer
     const r = await _fetch(`${INDEXER_URL}/search`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ question, top_k: Number(top_k) || 6 })
+      body: JSON.stringify({ question, top_k: k }),
     });
     const search = await r.json().catch(() => ({}));
     if (!r.ok || !search?.ok) {
-      return res.status(502).json({ error: 'retrieval_failed', detail: search });
+      return jsonErr(res, 502, 'retrieval_failed', { detail: search });
     }
-    const contexts = search.items || [];
+    const contexts = Array.isArray(search.items) ? search.items : [];
 
-    // perkaya dengan judul dokumen + snippet pendek
+    // 2) Perkaya dengan judul dokumen + snippet pendek
     const ids = Array.from(new Set(contexts.map(c => c.document_id)));
     const titles = {};
     if (ids.length) {
       const { data: rows } = await supabase
         .from(TABLE)
-        .select('id,title,storage_path')
+        .select('id, title, storage_path')
         .in('id', ids);
       for (const row of (rows || [])) {
         titles[row.id] = row.title || row.storage_path || '(untitled)';
@@ -250,24 +345,24 @@ app.post('/chat/ask', async (req, res) => {
         chunk_index: c.chunk_index,
         similarity: c.similarity,
         title,
-        preview
+        preview,
       };
     });
 
-    // Susun teks sumber untuk prompt (pakai konten apa adanya)
+    // 3) Susun teks sumber untuk prompt (pakai konten apa adanya)
     const sourcesText = contexts.map((c, i) =>
       `[${i + 1}] (doc:${c.document_id} #${c.chunk_index})\n${c.content}`
     ).join('\n\n---\n\n');
 
-    // 2) Kalau belum set GEMINI_API_KEY → fallback (kembalikan konteks enriched)
+    // 4) Jika GEMINI_API_KEY belum ada → fallback (kembalikan konteks enriched)
     if (!process.env.GEMINI_API_KEY) {
       return res.json({
         answer: 'GEMINI_API_KEY belum di-set. Berikut konteks terdekat.',
-        sources
+        sources,
       });
     }
 
-    // 3) Panggil Gemini buat merangkai jawaban
+    // 5) Panggil Gemini buat merangkai jawaban
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
 
@@ -275,24 +370,25 @@ app.post('/chat/ask', async (req, res) => {
       `Kamu adalah "Tutor Cerdas". Jawab singkat, jelas, dan dalam Bahasa Indonesia.`,
       `Jawab HANYA berdasarkan "KONTEKS" berikut. Jika tidak ada jawabannya di konteks,`,
       `balas: "Tidak ditemukan di materi." Jangan mengarang.`,
-      ``,
+      '',
       `KONTEKS:\n${sourcesText}`,
-      ``,
-      `PERTANYAAN: ${question}`
+      '',
+      `PERTANYAAN: ${question}`,
     ].join('\n');
 
     const resp = await model.generateContent(prompt);
     const text = resp?.response?.text?.() || 'Tidak ditemukan di materi.';
 
-    // 4) Response berisi jawaban + sumber (judul + snippet)
-    res.json({ answer: text, sources });
+    return res.json({ answer: text, sources });
   } catch (e) {
     console.error('[chat/ask] error', e);
-    res.status(500).json({ error: String(e) });
+    return jsonErr(res, 500, String(e));
   }
 });
 
-/* ===== Start ===== */
+/* ==========================================
+ *  Start
+ * ========================================== */
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, '0.0.0.0', () => {
   console.log('API running on http://localhost:' + PORT);
