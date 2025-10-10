@@ -522,7 +522,7 @@ app.post('/chat/ask', requireAuth, async (req, res) => {
 /* ==========================================
  *  Start
  * ========================================== */
-const PORT = process.env.PORT || 8787
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('API running on http://localhost:' + PORT)
-})
+  console.log(`API running on port ${PORT}`);
+});
