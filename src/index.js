@@ -519,6 +519,10 @@ app.post('/chat/ask', requireAuth, async (req, res) => {
     return jsonErr(res, 500, String(e))
   }
 })
+// root GET — untuk health-check platform yang mungkin memanggil GET /
+app.get('/', (_req, res) => {
+  res.status(200).json({ ok: true, service: 'tutor-cerdas-api', ts: new Date().toISOString() })
+})
 
 /* ==========================================
  *  Robust start + graceful shutdown + debug
