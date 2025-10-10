@@ -1,77 +1,51 @@
-import { supabaseAdmin } from '../supabase.js'
+// src/middleware/auth.js
+const supabase = require('../supabase')
 
-/**
- * ✅ Middleware autentikasi utama
- * - Verifikasi Bearer token
- * - Ambil data user dari Supabase
- * - Sematkan user, role, dan profil ke req
- */
-export async function requireAuth(req, res, next) {
+// helpers
+function getToken(req) {
+  const h = req.headers.authorization || req.headers.Authorization || ''
+  return h.startsWith('Bearer ') ? h.slice(7).trim() : null
+}
+
+async function requireAuth(req, res, next) {
   try {
-    const authHeader = req.headers.authorization || req.headers.Authorization
-    if (!authHeader?.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Missing or invalid Authorization header' })
-    }
+    const token = getToken(req)
+    if (!token) return res.status(401).json({ error: 'Unauthorized' })
 
-    const token = authHeader.split(' ')[1]?.trim()
-    if (!token) {
-      return res.status(401).json({ error: 'Missing Bearer token' })
-    }
-
-    // ✅ Verifikasi token dengan Supabase
-    const { data, error } = await supabaseAdmin.auth.getUser(token)
+    const { data, error } = await supabase.auth.getUser(token)
     if (error || !data?.user) {
-      console.warn('[Auth] Invalid token:', error?.message)
-      return res.status(401).json({ error: 'Invalid or expired token' })
+      console.warn('[auth] invalid token:', error?.message)
+      return res.status(401).json({ error: 'Invalid token' })
     }
 
-    // Simpan user ke request
     req.user = data.user
+    next()
+  } catch (e) {
+    console.error('[auth] unexpected error', e)
+    return res.status(401).json({ error: 'Auth failed' })
+  }
+}
 
-    // ✅ Ambil profil + role user
-    const { data: profile, error: profileErr } = await supabaseAdmin
+async function isAdminUser(userId) {
+  try {
+    const { data, error } = await supabase
       .from('profiles')
-      .select('id, role, full_name')
-      .eq('id', req.user.id)
+      .select('role')
+      .eq('id', userId)
       .single()
-
-    if (profileErr) {
-      console.warn(`[Auth] Failed to fetch profile for ${req.user.id}:`, profileErr.message)
-      req.role = 'user'
-      req.profile = null
-    } else {
-      req.role = profile?.role || 'user'
-      req.profile = profile || null
-    }
-
-    // ✅ Logging minimal (optional)
-    // console.log(`[Auth] ${req.user.email} (${req.role}) authenticated`)
-
-    next()
-  } catch (err) {
-    console.error('[Auth] Unexpected error:', err)
-    res.status(500).json({ error: 'Internal authentication error' })
+    if (error || !data) return false
+    return data.role === 'admin'
+  } catch (e) {
+    console.warn('[isAdminUser] error', e)
+    return false
   }
 }
 
-/**
- * ✅ Middleware untuk membatasi akses berdasarkan role
- * Contoh: app.get('/admin', requireRole('admin'), handler)
- */
-export function requireRole(...allowedRoles) {
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({ error: 'Unauthenticated' })
-    }
-
-    if (!req.role || !allowedRoles.includes(req.role)) {
-      console.warn(`[Auth] Forbidden: ${req.user.email} (role: ${req.role})`)
-      return res.status(403).json({ 
-        error: 'Forbidden', 
-        message: `Required role: ${allowedRoles.join(', ')}` 
-      })
-    }
-
-    next()
-  }
+async function requireAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'Unauthorized' })
+  const ok = await isAdminUser(req.user.id)
+  if (!ok) return res.status(403).json({ error: 'Forbidden' })
+  next()
 }
+
+module.exports = { getToken, requireAuth, requireAdmin, isAdminUser }
