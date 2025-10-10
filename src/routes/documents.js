@@ -1,71 +1,51 @@
-// src/routes/documents.js
-const express = require('express')
-const multer = require('multer')
-const crypto = require('crypto')
+// src/middleware/auth.js
 const supabase = require('../supabase')
-const cfg = require('../config')
-const { requireAuth, requireAdmin } = require('../middleware/auth')
 
-const router = express.Router()
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 30 * 1024 * 1024 } })
-
-function safeExt(name, fallback = 'pdf') {
-  const ext = (name?.split('.').pop() || fallback).toLowerCase()
-  return ext.replace(/[^a-z0-9]/g, '') || fallback
-}
-function randomKey(bytes = 6) {
-  return crypto.randomBytes(bytes).toString('hex')
+// helpers
+function getToken(req) {
+  const h = req.headers.authorization || req.headers.Authorization || ''
+  return h.startsWith('Bearer ') ? h.slice(7).trim() : null
 }
 
-// upload
-router.post('/upload', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
+async function requireAuth(req, res, next) {
   try {
-    if (!req.file) return res.status(400).json({ error: 'file is required' })
-    if (req.file.mimetype && !/pdf/i.test(req.file.mimetype)) return res.status(400).json({ error: 'only PDF is supported' })
+    const token = getToken(req)
+    if (!token) return res.status(401).json({ error: 'Unauthorized' })
 
-    const title = req.body?.title?.toString().slice(0, 180) || req.file.originalname.slice(0, 180)
-    const ext = safeExt(req.file.originalname, 'pdf')
-    const now = new Date()
-    const y = now.getUTCFullYear(); const m = String(now.getUTCMonth() + 1).padStart(2, '0')
-    const storage_path = `${y}/${m}/${randomKey(8)}.${ext}`
+    const { data, error } = await supabase.auth.getUser(token)
+    if (error || !data?.user) {
+      console.warn('[auth] invalid token:', error?.message)
+      return res.status(401).json({ error: 'Invalid token' })
+    }
 
-    const { error: upErr } = await supabase.storage.from(cfg.BUCKET).upload(storage_path, req.file.buffer, {
-      contentType: req.file.mimetype || 'application/pdf', upsert: false
-    })
-    if (upErr) return res.status(500).json({ error: upErr.message })
-
-    const { data, error: insErr } = await supabase.from(cfg.TABLE).insert({ title, storage_path, size: req.file.size, status: 'uploaded' }).select().single()
-    if (insErr) return res.status(500).json({ error: insErr.message })
-
-    return res.json({ ok: true, document: data })
+    req.user = data.user
+    next()
   } catch (e) {
-    console.error('[documents/upload] error', e)
-    return res.status(500).json({ error: 'internal' })
+    console.error('[auth] unexpected error', e)
+    return res.status(401).json({ error: 'Auth failed' })
   }
-})
+}
 
-// list, get, delete, chunks etc — keep your logic but prefixed with router
-router.get('/', requireAuth, requireAdmin, async (req, res) => {
+async function isAdminUser(userId) {
   try {
-    const { data, error } = await supabase.from(cfg.TABLE).select('*').order('created_at', { ascending: false }).limit(100)
-    if (error) return res.status(500).json({ error: error.message })
-    return res.json({ items: data || [] })
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', userId)
+      .single()
+    if (error || !data) return false
+    return data.role === 'admin'
   } catch (e) {
-    console.error('[documents] list error', e)
-    return res.status(500).json({ error: 'internal' })
+    console.warn('[isAdminUser] error', e)
+    return false
   }
-})
+}
 
-router.get('/:id', requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from(cfg.TABLE).select('id, title, storage_path, size, status, created_at').eq('id', req.params.id).single()
-    if (error || !data) return res.status(404).json({ error: 'document not found' })
-    return res.json({ document: data })
-  } catch (e) {
-    console.error('[documents/:id] error', e)
-    return res.status(500).json({ error: 'internal' })
-  }
-})
+async function requireAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'Unauthorized' })
+  const ok = await isAdminUser(req.user.id)
+  if (!ok) return res.status(403).json({ error: 'Forbidden' })
+  next()
+}
 
-// export router
-module.exports = router
+module.exports = { getToken, requireAuth, requireAdmin, isAdminUser }
