@@ -6,21 +6,22 @@ const crypto = require('crypto')
 const path = require('path')
 const { createClient } = require('@supabase/supabase-js')
 
-// ==== [Gemini SDK] ====
-// Kompatibel dengan SDK lama (@google/generative-ai) & baru (google-genai).
+// ==== Gemini SDK (lazy init) ====
+// We'll attempt to require SDKs lazily when /chat or /models routes are called
 let getGenModel = null
 let usingNewGenAi = false
-try {
-  // SDK baru
-  const { GoogleGenerativeAI } = require('google-genai')
-  usingNewGenAi = true
-  getGenModel = (apiKey, model) => new GoogleGenerativeAI({ apiKey }).getGenerativeModel({ model })
-} catch {
-  // SDK lama (deprecated, tapi masih banyak dipakai)
+function initGenSdkIfNeeded() {
+  if (getGenModel) return
+  try {
+    const { GoogleGenerativeAI } = require('google-genai')
+    usingNewGenAi = true
+    getGenModel = (apiKey, model) => new GoogleGenerativeAI({ apiKey }).getGenerativeModel({ model })
+    return
+  } catch (_) {}
   try {
     const { GoogleGenerativeAI } = require('@google/generative-ai')
     getGenModel = (apiKey, model) => new GoogleGenerativeAI(apiKey).getGenerativeModel({ model })
-  } catch {}
+  } catch (_) {}
 }
 
 /* ==========================================
@@ -31,32 +32,31 @@ const app = express()
 // ---- CORS (whitelist dari ENV, + preflight OPTIONS)
 const allowedOrigins = process.env.WEB_ORIGIN
   ? process.env.WEB_ORIGIN.split(',').map(s => s.trim()).filter(Boolean)
-  : ['*'] // dev: allow all
+  : ['*']
 
 const corsOptions = allowedOrigins.includes('*')
   ? { origin: true, credentials: true }
   : {
-      origin(origin, cb) {
-        if (!origin) return cb(null, true) // curl/postman
-        cb(null, allowedOrigins.includes(origin))
-      },
-      credentials: true
-    }
+    origin(origin, cb) {
+      if (!origin) return cb(null, true) // curl/postman
+      cb(null, allowedOrigins.includes(origin))
+    },
+    credentials: true
+  }
 
 app.use(cors(corsOptions))
 app.options('*', cors(corsOptions))
 app.use(express.json({ limit: '10mb' }))
 
-// (opsional) keamanan tambahan
-// const helmet = require('helmet')
-// app.use(helmet({
-//   crossOriginResourcePolicy: { policy: 'cross-origin' },
-//   contentSecurityPolicy: false
-// }))
-
-// (opsional) rate limit
-// const rateLimit = require('express-rate-limit')
-// app.use(rateLimit({ windowMs: 60_000, max: 120 }))
+// Simple request logging (minimal)
+app.use((req, res, next) => {
+  const start = Date.now()
+  res.on('finish', () => {
+    const ms = Date.now() - start
+    console.log(`[req] ${req.method} ${req.originalUrl} ${res.statusCode} - ${ms}ms`)
+  })
+  next()
+})
 
 /* ==========================================
  *  Supabase Admin client (service role)
@@ -64,9 +64,9 @@ app.use(express.json({ limit: '10mb' }))
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
 if (!SUPABASE_URL || !SERVICE_KEY) {
-  console.warn('[startup] SUPABASE_URL / SERVICE_KEY belum di-set.')
+  console.warn('[startup] WARNING: SUPABASE_URL or SERVICE_KEY is not set. Some routes may fail.')
 }
-const supabase = createClient(SUPABASE_URL, SERVICE_KEY, {
+const supabase = createClient(SUPABASE_URL || '', SERVICE_KEY || '', {
   auth: { persistSession: false, autoRefreshToken: false }
 })
 
@@ -74,16 +74,17 @@ const supabase = createClient(SUPABASE_URL, SERVICE_KEY, {
  *  Konstanta
  * ========================================== */
 const BUCKET = process.env.DOCS_BUCKET || 'documents'
-const TABLE  = process.env.DOCS_TABLE  || 'documents'
-const INDEXER_URL = process.env.INDEXER_URL // ex: https://<indexer>.up.railway.app
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash' // disarankan model aktif
+const TABLE = process.env.DOCS_TABLE || 'documents'
+const INDEXER_URL = process.env.INDEXER_URL || ''
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash'
 
-// ---- Upload config (PDF s/d 30MB)
+/* ==========================================
+ *  Multer Upload config
+ * ========================================== */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    // longgarkan kalau perlu selain PDF
     if (!file.mimetype || !/pdf/i.test(file.mimetype)) {
       return cb(new Error('only PDF is supported'))
     }
@@ -91,16 +92,18 @@ const upload = multer({
   }
 })
 
-// ---- util fetch + timeout
+/* ==========================================
+ *  Fetch with timeout (safe)
+ * ========================================== */
 const _fetch = (...args) => (
-  global.fetch ? global.fetch(...args) : import('node-fetch').then(({ default: f }) => f(...args))
+  (typeof global.fetch === 'function') ? global.fetch(...args) : import('node-fetch').then(({ default: f }) => f(...args))
 )
 async function fetchWithTimeout(resource, options = {}, ms = 25_000) {
   const { AbortController } = global
-  const ctl = new AbortController()
-  const id = setTimeout(() => ctl.abort(), ms)
+  const controller = new AbortController()
+  const id = setTimeout(() => controller.abort(), ms)
   try {
-    return await _fetch(resource, { ...options, signal: ctl.signal })
+    return await _fetch(resource, { ...options, signal: controller.signal })
   } finally {
     clearTimeout(id)
   }
@@ -115,7 +118,7 @@ const clampInt = (v, min, max, def) => {
   return Math.min(Math.max(n, min), max)
 }
 
-const jsonOk  = (res, obj = {}) => res.json({ ok: true, ...obj })
+const jsonOk = (res, obj = {}) => res.json({ ok: true, ...obj })
 const jsonErr = (res, code, msg, extra) => res.status(code).json({ error: msg, ...(extra || {}) })
 
 function safeExt(name, fallback = 'pdf') {
@@ -126,34 +129,44 @@ function randomKey(bytes = 6) {
   return crypto.randomBytes(bytes).toString('hex')
 }
 
-// ---- Auth helpers (Bearer token dari Supabase)
+/* ==========================================
+ *  Auth helpers (Bearer token dari Supabase)
+ * ========================================== */
 function getToken(req) {
-  const h = req.headers.authorization || ''
-  return h.startsWith('Bearer ') ? h.slice(7) : null
+  const h = req.headers.authorization || req.headers.Authorization || ''
+  return h.startsWith('Bearer ') ? h.slice(7).trim() : null
 }
 
 async function requireAuth(req, res, next) {
   try {
     const token = getToken(req)
     if (!token) return jsonErr(res, 401, 'Unauthorized')
-    const { data, error } = await supabase.auth.getUser(token) // aman, selalu re-validate ke Auth server
-    if (error || !data?.user) return jsonErr(res, 401, 'Invalid token')
-    req.user = data.user // { id, email, ... }
+    const { data, error } = await supabase.auth.getUser(token)
+    if (error || !data?.user) {
+      console.warn('[auth] invalid token or supabase.auth.getUser error:', error?.message)
+      return jsonErr(res, 401, 'Invalid token')
+    }
+    req.user = data.user
     next()
   } catch (e) {
+    console.error('[auth] unexpected error:', e)
     return jsonErr(res, 401, 'Auth failed', { detail: String(e) })
   }
 }
 
-// NOTE: di desain kita, kolom PK profiles adalah `id` (FK ke auth.users.id).
 async function isAdminUser(userId) {
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', userId)      // <-- FIX: tadinya `user_id`, harusnya `id`
-    .single()
-  if (error || !data) return false
-  return data?.role === 'admin'
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', userId)
+      .single()
+    if (error || !data) return false
+    return data.role === 'admin'
+  } catch (e) {
+    console.warn('[isAdminUser] error', e)
+    return false
+  }
 }
 
 async function requireAdmin(req, res, next) {
@@ -164,7 +177,7 @@ async function requireAdmin(req, res, next) {
 }
 
 /* ==========================================
- *  Health & Meta
+ *  Routes
  * ========================================== */
 app.get('/health', async (_req, res) => {
   res.json({
@@ -173,50 +186,42 @@ app.get('/health', async (_req, res) => {
     indexer: !!INDEXER_URL,
     supabase: !!(SUPABASE_URL && SERVICE_KEY),
     model: GEMINI_MODEL,
-    sdk: usingNewGenAi ? 'google-genai' : '@google/generative-ai',
+    sdk: getGenModel ? (usingNewGenAi ? 'google-genai' : '@google/generative-ai') : '(not-initialized)',
     ts: new Date().toISOString()
   })
 })
 
 app.get('/auth/me', requireAuth, async (req, res) => {
-  // kirim role sekalian
   let role = 'user'
   try {
     const { data } = await supabase.from('profiles').select('role').eq('id', req.user.id).single()
     role = data?.role || 'user'
-  } catch {}
+  } catch (e) { /* ignore */ }
   res.json({ ok: true, user: { id: req.user.id, email: req.user.email, role } })
 })
 
-/* (opsional) list model untuk debugging pemilihan model */
 app.get('/models', async (_req, res) => {
-  if (!process.env.GEMINI_API_KEY || !getGenModel) {
-    return jsonErr(res, 400, 'Gemini SDK/API key not configured')
-  }
+  if (!process.env.GEMINI_API_KEY) return jsonErr(res, 400, 'GEMINI_API_KEY not configured')
   try {
-    // Endpoint list bervariasi; gunakan REST langsung (aman untuk debug)
+    initGenSdkIfNeeded()
+    if (!getGenModel) return jsonErr(res, 500, 'Gemini SDK not available on server')
     const url = 'https://generativelanguage.googleapis.com/v1/models?key=' + encodeURIComponent(process.env.GEMINI_API_KEY)
     const r = await fetchWithTimeout(url, {}, 10_000)
     const body = await r.json().catch(() => ({}))
     res.status(r.status).json(body)
   } catch (e) {
+    console.error('[models] error', e)
     jsonErr(res, 500, 'list models failed', { detail: String(e) })
   }
 })
 
 app.head('/', (_req, res) => res.status(204).end())
 
-/* ==========================================
- *  Documents (ADMIN ONLY)
- * ========================================== */
-
-// Upload PDF
+/* Documents endpoints (same logic, preserved) */
 app.post('/documents/upload', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return jsonErr(res, 400, 'file is required')
-    if (req.file.mimetype && !/pdf/i.test(req.file.mimetype)) {
-      return jsonErr(res, 400, 'only PDF is supported')
-    }
+    if (req.file.mimetype && !/pdf/i.test(req.file.mimetype)) return jsonErr(res, 400, 'only PDF is supported')
 
     const title = req.body?.title?.toString().slice(0, 180) || req.file.originalname.slice(0, 180)
     const ext = safeExt(req.file.originalname, 'pdf')
@@ -243,11 +248,11 @@ app.post('/documents/upload', requireAuth, requireAdmin, upload.single('file'), 
 
     return jsonOk(res, { document: data })
   } catch (e) {
+    console.error('[upload] error', e)
     return jsonErr(res, 500, String(e))
   }
 })
 
-// List Documents
 app.get('/documents', requireAuth, requireAdmin, async (_req, res) => {
   try {
     let { data, error } = await supabase
@@ -262,11 +267,11 @@ app.get('/documents', requireAuth, requireAdmin, async (_req, res) => {
     if (error) return jsonErr(res, 500, error.message)
     return res.json({ items: data || [] })
   } catch (e) {
+    console.error('[documents] list error', e)
     return jsonErr(res, 500, String(e))
   }
 })
 
-// Get single document
 app.get('/documents/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -276,11 +281,11 @@ app.get('/documents/:id', requireAuth, requireAdmin, async (req, res) => {
     if (error || !data) return jsonErr(res, 404, 'document not found')
     return jsonOk(res, { document: data })
   } catch (e) {
+    console.error('[documents/:id] error', e)
     return jsonErr(res, 500, String(e))
   }
 })
 
-// Signed URL
 app.get('/documents/:id/url', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { data: doc, error } = await supabase
@@ -292,21 +297,20 @@ app.get('/documents/:id/url', requireAuth, requireAdmin, async (req, res) => {
 
     const { data, error: e2 } = await supabase
       .storage.from(BUCKET)
-      .createSignedUrl(doc.storage_path, 3600) // 1 jam
+      .createSignedUrl(doc.storage_path, 3600)
 
     if (!e2 && data?.signedUrl) {
       return jsonOk(res, { url: data.signedUrl, title: doc.title, storage_path: doc.storage_path })
     }
 
-    // Fallback (bucket public)
     const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${doc.storage_path}`
     return jsonOk(res, { url: publicUrl, title: doc.title, storage_path: doc.storage_path, public: true })
   } catch (e) {
+    console.error('[documents/:id/url] error', e)
     return jsonErr(res, 500, String(e))
   }
 })
 
-// Delete document + chunks
 app.delete('/documents/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
     const id = req.params.id
@@ -327,11 +331,11 @@ app.delete('/documents/:id', requireAuth, requireAdmin, async (req, res) => {
 
     return jsonOk(res, { deleted: id })
   } catch (e) {
+    console.error('[documents/:id] delete error', e)
     return jsonErr(res, 500, String(e))
   }
 })
 
-// Chunks per document
 app.get('/documents/:id/chunks', requireAuth, requireAdmin, async (req, res) => {
   try {
     const id = req.params.id
@@ -346,11 +350,11 @@ app.get('/documents/:id/chunks', requireAuth, requireAdmin, async (req, res) => 
     if (error) return jsonErr(res, 500, error.message)
     return res.json({ items: data || [], count: count ?? 0, limit, offset })
   } catch (e) {
+    console.error('[chunks] error', e)
     return jsonErr(res, 500, String(e))
   }
 })
 
-// Preview N chunk pertama
 app.get('/documents/:id/preview', requireAuth, requireAdmin, async (req, res) => {
   try {
     const id = req.params.id
@@ -365,11 +369,11 @@ app.get('/documents/:id/preview', requireAuth, requireAdmin, async (req, res) =>
     const text = (data || []).map(x => x.content).join('\n\n---\n\n')
     return res.type('text/plain').send(text)
   } catch (e) {
+    console.error('[preview] error', e)
     return jsonErr(res, 500, String(e))
   }
 })
 
-// Rebuild (chunk+embed) melalui INDEXER
 app.post('/documents/rebuild/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
     if (!INDEXER_URL) return jsonErr(res, 500, 'INDEXER_URL not set')
@@ -379,14 +383,12 @@ app.post('/documents/rebuild/:id', requireAuth, requireAdmin, async (req, res) =
     if (error || !doc) return jsonErr(res, 404, 'document not found')
     if (!doc.storage_path) return jsonErr(res, 400, 'no storage_path; re-upload file')
 
-    // endpoint baru
     let r = await fetchWithTimeout(`${INDEXER_URL}/process/document`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ document_id: req.params.id })
     }, 60_000)
 
-    // fallback endpoint lama
     if (r.status === 404) {
       r = await fetchWithTimeout(`${INDEXER_URL}/embed/document`, {
         method: 'POST',
@@ -416,7 +418,7 @@ app.post('/chat/ask', requireAuth, async (req, res) => {
 
     const k = clampInt(top_k, 1, 12, 6)
 
-    // (A) Pastikan ada chat_session milik user
+    // (A) Chat session handling
     let sessionId = givenSessionId
     if (sessionId) {
       const { data: sess, error: sErr } = await supabase
@@ -437,24 +439,22 @@ app.post('/chat/ask', requireAuth, async (req, res) => {
       sessionId = newSess.id
     }
 
-    // simpan pertanyaan user (best-effort)
+    // best-effort save user message
     supabase.from('messages')
       .insert([{ session_id: sessionId, sender: 'user', content: question }])
       .then(() => {}).catch(e => console.warn('[chat] insert user message warn:', e?.message))
 
-    // (B) Retrieval dari Indexer
+    // (B) Retrieval from Indexer
     const r = await fetchWithTimeout(`${INDEXER_URL}/search`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ question, top_k: k })
     }, 30_000)
     const search = await r.json().catch(() => ({}))
-    if (!r.ok || !search?.ok) {
-      return jsonErr(res, 502, 'retrieval_failed', { detail: search })
-    }
+    if (!r.ok || !search?.ok) return jsonErr(res, 502, 'retrieval_failed', { detail: search })
     const contexts = Array.isArray(search.items) ? search.items : []
 
-    // (C) perkaya judul dokumen
+    // (C) enrich titles
     const ids = Array.from(new Set(contexts.map(c => c.document_id)))
     const titles = {}
     if (ids.length) {
@@ -479,24 +479,25 @@ app.post('/chat/ask', requireAuth, async (req, res) => {
       `[${i + 1}] (doc:${c.document_id} #${c.chunk_index})\n${c.content}`
     ).join('\n\n---\n\n')
 
-    // (D) Jawaban via Gemini
+    // (D) Generate answer via Gemini (lazy init)
     let answerText = 'Tidak ditemukan di materi.'
-    if (!process.env.GEMINI_API_KEY || !getGenModel) {
+    if (!process.env.GEMINI_API_KEY) {
       answerText = 'GEMINI_API_KEY/SDK belum di-set. Berikut konteks terdekat.'
     } else {
-      const model = getGenModel(process.env.GEMINI_API_KEY, GEMINI_MODEL)
-      const prompt = [
-        `Kamu adalah "Tutor Cerdas". Jawab singkat, jelas, dan dalam Bahasa Indonesia.`,
-        `Jawab HANYA berdasarkan "KONTEKS" berikut. Jika tidak ada jawabannya di konteks,`,
-        `balas: "Tidak ditemukan di materi." Jangan mengarang.`,
-        '',
-        `KONTEKS:\n${sourcesText}`,
-        '',
-        `PERTANYAAN: ${question}`
-      ].join('\n')
-
       try {
-        // SDK lama & baru punya antarmuka mirip:
+        initGenSdkIfNeeded()
+        if (!getGenModel) throw new Error('Gemini SDK not available')
+        const model = getGenModel(process.env.GEMINI_API_KEY, GEMINI_MODEL)
+        const prompt = [
+          `Kamu adalah "Tutor Cerdas". Jawab singkat, jelas, dan dalam Bahasa Indonesia.`,
+          `Jawab HANYA berdasarkan "KONTEKS" berikut. Jika tidak ada jawabannya di konteks,`,
+          `balas: "Tidak ditemukan di materi." Jangan mengarang.`,
+          '',
+          `KONTEKS:\n${sourcesText}`,
+          '',
+          `PERTANYAAN: ${question}`
+        ].join('\n')
+
         const resp = await model.generateContent(prompt)
         answerText = typeof resp?.response?.text === 'function'
           ? resp.response.text()
@@ -507,7 +508,7 @@ app.post('/chat/ask', requireAuth, async (req, res) => {
       }
     }
 
-    // (E) simpan jawaban (best-effort)
+    // (E) save assistant message (best-effort)
     supabase.from('messages')
       .insert([{ session_id: sessionId, sender: 'assistant', content: answerText, sources }])
       .then(() => {}).catch(e => console.warn('[chat] insert assistant message warn:', e?.message))
@@ -520,9 +521,47 @@ app.post('/chat/ask', requireAuth, async (req, res) => {
 })
 
 /* ==========================================
- *  Start
+ *  Robust start + graceful shutdown + debug
  * ========================================== */
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`API running on port ${PORT}`);
-});
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] uncaughtException:', err && (err.stack || err.message || String(err)))
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] unhandledRejection:', reason && (reason.stack || reason.message || String(reason)))
+})
+
+let shuttingDown = false
+async function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.warn(`[shutdown] Received ${signal}. Closing server...`)
+  try {
+    // cleanups if any
+  } catch (e) {
+    console.error('[shutdown] cleanup error', e)
+  }
+  setTimeout(() => {
+    console.warn('[shutdown] Exiting process now')
+    process.exit(0)
+  }, 5000)
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
+
+const PORT = Number(process.env.PORT) || 8080
+
+console.log('---- Startup info ----')
+console.log('NODE_ENV:', process.env.NODE_ENV || 'dev')
+console.log('PORT:', PORT)
+console.log('SUPABASE_URL set:', !!process.env.SUPABASE_URL)
+console.log('SUPABASE_SERVICE_KEY set:', !!(process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY))
+console.log('INDEXER_URL set:', !!process.env.INDEXER_URL)
+console.log('GEMINI_API_KEY set:', !!process.env.GEMINI_API_KEY)
+console.log('WEB_ORIGIN:', process.env.WEB_ORIGIN || '(not set)')
+console.log('----------------------')
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`API running on port ${PORT}`)
+})
+server.on('close', () => console.warn('[server] closed'))
+server.on('error', (err) => console.error('[server] error', err && (err.stack || err.message || String(err))))
