@@ -1,100 +1,87 @@
 // src/routes/chat.js
-const express = require('express')
-const supabase = require('../supabase')
-const cfg = require('../config')
-const { requireAuth } = require('../middleware/auth')
-const { fetchWithTimeout } = require('../utils/fetchWithTimeout')
-const { initGenSdkIfNeeded, getGenModel } = require('../utils/genSdk')
+const express = require('express');
+const router = express.Router();
+const { supabaseAdmin } = require('../lib/supabaseClient');
+const { generateText } = require('../lib/gemini');
+const fetch = require('node-fetch');
 
-const router = express.Router()
+const RAG_WORKER_URL = process.env.RAG_WORKER_URL; // e.g., https://tutor-rag-worker.railway.app
 
-const clampInt = (v, min, max, def) => {
-  const n = Number.parseInt(v ?? def, 10)
-  if (Number.isNaN(n)) return def
-  return Math.min(Math.max(n, min), max)
+if (!RAG_WORKER_URL) {
+  console.warn('RAG_WORKER_URL not set. Set to RAG worker base URL.');
 }
 
-router.post('/ask', requireAuth, async (req, res) => {
+/**
+ * POST /api/chat
+ * body: { question, chat_id (optional), filter_document (optional) }
+ * Header: Authorization: Bearer <supabase_access_token>  (frontend should forward session access token)
+ */
+router.post('/', async (req, res) => {
   try {
-    const { question, top_k, session_id: givenSessionId } = req.body || {}
-    if (!question) return res.status(400).json({ error: 'question is required' })
-    if (!cfg.INDEXER_URL) return res.status(500).json({ error: 'INDEXER_URL not set' })
+    const supabaseToken = (req.headers.authorization || '').replace('Bearer ', '');
+    const { question, chat_id, filter_document } = req.body;
+    if (!question) return res.status(400).json({ error: 'question required' });
 
-    const k = clampInt(top_k, 1, 12, 6)
-    let sessionId = givenSessionId
-    if (!sessionId) {
-      const { data: newSess, error: nErr } = await supabase.from('chat_sessions').insert([{ user_id: req.user.id, title: (question||'').slice(0,60) }]).select('id').single()
-      if (nErr) return res.status(500).json({ error: nErr.message })
-      sessionId = newSess.id
-    } else {
-      const { data: sess, error: sErr } = await supabase.from('chat_sessions').select('id,user_id').eq('id', sessionId).single()
-      if (sErr || !sess) return res.status(404).json({ error: 'session not found' })
-      if (sess.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' })
+    // 1) call RAG worker for top-k chunks (RAG worker should call Supabase using service key)
+    const searchUrl = `${RAG_WORKER_URL.replace(/\/+$/,'')}/search`;
+    const searchResp = await fetch(searchUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-SERVICE-KEY': process.env.WORKER_SERVICE_KEY || '' },
+      body: JSON.stringify({ query: question, k: 6, filter_document })
+    });
+    if (!searchResp.ok) {
+      const t = await searchResp.text();
+      console.warn('RAG worker search failed', t);
+      // proceed without retrieved context (fallback to pure generation)
     }
+    const searchData = await searchResp.json().catch(()=>null);
+    const chunks = (searchData && searchData.items) || [];
 
-    // save user message best-effort
-    supabase.from('messages').insert([{ session_id: sessionId, sender: 'user', content: question }]).then(()=>{}).catch(e=>console.warn('[chat] insert user message warn', e?.message))
+    // decide out_of_context based on top similarity threshold
+    const topSim = (chunks[0] && chunks[0].similarity) || 0;
+    const SIMILARITY_THRESHOLD = parseFloat(process.env.SIMILARITY_THRESHOLD || '0.25');
+    const out_of_context = topSim < SIMILARITY_THRESHOLD;
 
-    // retrieval
-    const r = await fetchWithTimeout(`${cfg.INDEXER_URL}/search`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, top_k: k })
-    }, 30000)
-    const search = await r.json().catch(()=>({}))
-    if (!r.ok || !search?.ok) return res.status(502).json({ error: 'retrieval_failed', detail: search })
-    const contexts = Array.isArray(search.items) ? search.items : []
+    // 2) build prompt
+    let systemPrompt = "Kamu adalah tutor cerdas dan sopan yang menjawab dalam Bahasa Indonesia. Gunakan materi yang relevan dari konteks yang disediakan. Jika pertanyaan di luar konteks materi, awali jawaban dengan 'Catatan: pertanyaan ini berada di luar cakupan materi. Jawaban berikut dibuat menggunakan model generatif.'";
+    let contextText = chunks.map((c, i) => `---chunk ${i+1} (doc: ${c.document_title||c.document_id} | idx:${c.chunk_index} | sim:${(c.similarity||0).toFixed(3)})---\n${c.text}`).join("\n\n");
+    if (!contextText) contextText = '';
 
-    // enrich titles
-    const ids = Array.from(new Set(contexts.map(c=>c.document_id)))
-    const titles = {}
-    if (ids.length) {
-      const { data: rows } = await supabase.from(cfg.TABLE).select('id, title, storage_path').in('id', ids)
-      for (const row of (rows||[])) { titles[row.id] = row.title || row.storage_path || '(untitled)' }
-    }
+    let prompt = `${systemPrompt}\n\nKonteks:\n${contextText}\n\nPertanyaan pengguna:\n${question}\n\nJawab secara ringkas dan sertakan referensi chunk jika relevan.`;
 
-    const sources = contexts.map((c,i)=>({
-      id: `${c.document_id}:${c.chunk_index}`, index: i+1, document_id: c.document_id, chunk_index: c.chunk_index,
-      similarity: c.similarity, title: titles[c.document_id] || c.document_id, preview: (c.content||'').replace(/\s+/g,' ').slice(0,200)
-    }))
+    // if out of context, add explicit note to the user first (Gemini will include it because it's in system prompt)
+    // 3) call Gemini
+    const genText = await generateText(prompt, { temperature: 0.2, maxTokens: 512 });
 
-    const sourcesText = contexts.map((c,i)=>`[${i+1}] (doc:${c.document_id} #${c.chunk_index})\n${c.content}`).join('\n\n---\n\n')
-
-    // generate via Gemini
-    let answerText = 'Tidak ditemukan di materi.'
-    if (!cfg.GEMINI_API_KEY) {
-      answerText = 'GEMINI_API_KEY/SDK belum di-set. Berikut konteks terdekat.'
-    } else {
-      try {
-        initGenSdkIfNeeded()
-        const gm = getGenModel()
-        if (!gm) throw new Error('Gemini SDK not available')
-        const model = gm(cfg.GEMINI_API_KEY, cfg.GEMINI_MODEL)
-        const prompt = [
-          `Kamu adalah "Tutor Cerdas". Jawab singkat, jelas, dan dalam Bahasa Indonesia.`,
-          `Jawab HANYA berdasarkan "KONTEKS" berikut. Jika tidak ada jawabannya di konteks,`,
-          `balas: "Tidak ditemukan di materi." Jangan mengarang.`,
-          '',
-          `KONTEKS:\n${sourcesText}`,
-          '',
-          `PERTANYAAN: ${question}`
-        ].join('\n')
-        const resp = await model.generateContent(prompt)
-        answerText = typeof resp?.response?.text === 'function'
-          ? resp.response.text()
-          : (resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || 'Tidak ditemukan di materi.')
-      } catch (e) {
-        console.error('[gemini] error', e)
-        answerText = 'Maaf, terjadi kesalahan saat memanggil model.'
+    // 4) Save chat & message to Supabase (if token present)
+    let saved = null;
+    try {
+      if (supabaseToken) {
+        const supabaseUser = supabaseAdmin.auth.setAuth(supabaseToken);
+        // create chat if not present
+        let chatId = chat_id;
+        if (!chatId) {
+          const { data: chatData, error: chatErr } = await supabaseAdmin
+            .from('chats').insert({ user_id: supabaseUser?.user?.id || null, title: 'Chat', })
+            .select().single();
+          chatId = chatData?.id;
+        }
+        // insert message(s)
+        await supabaseAdmin.from('messages').insert([
+          { chat_id: chatId, role: 'user', content: question },
+          { chat_id: chatId, role: 'assistant', content: genText, metadata: { chunks, out_of_context } }
+        ]);
+        saved = { chat_id: chatId };
       }
+    } catch (e) {
+      console.warn('saving chat failed', e.message || e);
     }
 
-    // save assistant message best-effort
-    supabase.from('messages').insert([{ session_id: sessionId, sender: 'assistant', content: answerText, sources }]).then(()=>{}).catch(e=>console.warn('[chat] insert assistant message warn', e?.message))
-
-    return res.json({ ok: true, session_id: sessionId, answer: answerText, sources })
-  } catch (e) {
-    console.error('[chat/ask] error', e)
-    return res.status(500).json({ error: 'internal' })
+    return res.json({ reply: genText, chunks, out_of_context, saved });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || 'server error' });
   }
-})
+});
 
-module.exports = router
+module.exports = router;
