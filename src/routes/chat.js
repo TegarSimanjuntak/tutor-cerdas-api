@@ -3,7 +3,7 @@ const express = require('express');
 const router = express.Router();
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { generateText } = require('../lib/gemini');
-const fetch = require('node-fetch');
+const { fetch } = require('../lib/fetcher');
 
 const RAG_WORKER_URL = process.env.RAG_WORKER_URL; // e.g., https://tutor-rag-worker.railway.app
 
@@ -54,28 +54,37 @@ router.post('/', async (req, res) => {
     const genText = await generateText(prompt, { temperature: 0.2, maxTokens: 512 });
 
     // 4) Save chat & message to Supabase (if token present)
+    // ambil user dari access token
     let saved = null;
     try {
-      if (supabaseToken) {
-        const supabaseUser = supabaseAdmin.auth.setAuth(supabaseToken);
+    if (supabaseToken) {
+        // get user info from token
+        const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(supabaseToken);
+        if (userErr) throw userErr;
+        const userId = userData?.user?.id;
+
         // create chat if not present
         let chatId = chat_id;
         if (!chatId) {
-          const { data: chatData, error: chatErr } = await supabaseAdmin
-            .from('chats').insert({ user_id: supabaseUser?.user?.id || null, title: 'Chat', })
+        const { data: chatData, error: chatErr } = await supabaseAdmin
+            .from('chats').insert({ user_id: userId, title: 'Chat' })
             .select().single();
-          chatId = chatData?.id;
+        if (chatErr) throw chatErr;
+        chatId = chatData.id;
         }
-        // insert message(s)
-        await supabaseAdmin.from('messages').insert([
-          { chat_id: chatId, role: 'user', content: question },
-          { chat_id: chatId, role: 'assistant', content: genText, metadata: { chunks, out_of_context } }
+
+        // insert messages
+        const { error: msgErr } = await supabaseAdmin.from('messages').insert([
+        { chat_id: chatId, role: 'user', content: question },
+        { chat_id: chatId, role: 'assistant', content: genText, metadata: { chunks, out_of_context } }
         ]);
+        if (msgErr) throw msgErr;
         saved = { chat_id: chatId };
-      }
-    } catch (e) {
-      console.warn('saving chat failed', e.message || e);
     }
+    } catch (e) {
+    console.warn('saving chat failed', e.message || e);
+    }
+
 
     return res.json({ reply: genText, chunks, out_of_context, saved });
   } catch (err) {

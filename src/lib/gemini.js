@@ -1,12 +1,5 @@
 // src/lib/gemini.js
-let fetchFn = globalThis.fetch;
-if (!fetchFn) {
-  try {
-    fetchFn = require('undici').fetch;
-  } catch (e) {
-    throw new Error('No fetch available. Install undici or upgrade Node.');
-  }
-}
+const { fetch } = require('./fetcher');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5';
@@ -16,14 +9,12 @@ async function generateText(prompt, opts = {}) {
 
   const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(GEMINI_MODEL)}:generateText`;
   const body = {
-    prompt: {
-      text: prompt
-    },
+    prompt: { text: prompt },
     temperature: opts.temperature ?? 0.2,
     maxOutputTokens: opts.maxTokens ?? 512
   };
 
-  const res = await fetchFn(url, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${GEMINI_API_KEY}`,
