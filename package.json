@@ -7,6 +7,9 @@
     "dev": "node --watch src/index.js",
     "start": "node src/index.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@supabase/supabase-js": "^2.57.4",

@@ -152,7 +152,7 @@ async function isAdminUser(userId) {
     .select('role')
     .eq('id', userId)      // <-- FIX: tadinya `user_id`, harusnya `id`
     .single()
-  if (error || data) return false
+  if (error || !data) return false
   return data?.role === 'admin'
 }
 
