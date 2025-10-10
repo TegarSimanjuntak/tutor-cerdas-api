@@ -1,18 +1,16 @@
 // src/lib/gemini.js
-const fetch = require('node-fetch');
+let fetchFn = globalThis.fetch;
+if (!fetchFn) {
+  try {
+    fetchFn = require('undici').fetch;
+  } catch (e) {
+    throw new Error('No fetch available. Install undici or upgrade Node.');
+  }
+}
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5';
 
-if (!GEMINI_API_KEY) {
-  console.warn('GEMINI_API_KEY not set. Generation endpoints will fail until set.');
-}
-
-/**
- * generateText: call Google Generative API (adjust path if your setup differs)
- * NOTE: If your model requires different endpoint (generateContent vs generateText),
- * update the URL here.
- */
 async function generateText(prompt, opts = {}) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not configured');
 
@@ -25,7 +23,7 @@ async function generateText(prompt, opts = {}) {
     maxOutputTokens: opts.maxTokens ?? 512
   };
 
-  const res = await fetch(url, {
+  const res = await fetchFn(url, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${GEMINI_API_KEY}`,
@@ -39,14 +37,8 @@ async function generateText(prompt, opts = {}) {
     throw new Error(`Gemini API error: ${res.status} ${txt}`);
   }
   const data = await res.json();
-  // The response shape may differ; adapt parsing to the actual API response.
-  // Here we try to extract common fields.
-  if (data?.candidates && data.candidates[0]?.output) {
-    return data.candidates[0].output;
-  }
-  if (data?.output?.text) {
-    return data.output.text;
-  }
+  if (data?.candidates && data.candidates[0]?.output) return data.candidates[0].output;
+  if (data?.output?.text) return data.output.text;
   return JSON.stringify(data);
 }
 
