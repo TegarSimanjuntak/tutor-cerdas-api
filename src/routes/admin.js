@@ -4,12 +4,13 @@ const router = express.Router();
 const multer = require('multer');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { fetch } = require('../lib/fetcher');
+const checkAdmin = require('../middleware/checkAdmin');
 
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const RAG_WORKER_URL = process.env.RAG_WORKER_URL;
 const WORKER_SERVICE_KEY = process.env.WORKER_SERVICE_KEY;
-
+router.use(checkAdmin);
 /**
  * Admin upload document (PDF)
  * - This handler uploads PDF bytes to Supabase Storage, creates document row, and returns document id.
