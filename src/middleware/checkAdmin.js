@@ -3,6 +3,9 @@ const { supabaseAdmin } = require('../lib/supabaseClient');
 
 async function checkAdmin(req, res, next) {
   try {
+    // Allow preflight OPTIONS to pass through without auth checks
+    if (req.method === 'OPTIONS') return next();
+
     const authHeader = req.headers.authorization || '';
     const token = authHeader.replace('Bearer ', '').trim();
     if (!token) return res.status(401).json({ error: 'Missing auth token' });
@@ -28,7 +31,7 @@ async function checkAdmin(req, res, next) {
 
     // attach user info for downstream handlers
     req.currentUser = { id: userId, role: profile.role };
-    next();
+    return next();
   } catch (err) {
     console.error('checkAdmin err', err);
     return res.status(500).json({ error: 'server error' });
