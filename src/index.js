@@ -42,6 +42,36 @@ const corsOptions = {
 
 // Apply CORS globally
 app.use(cors(corsOptions));
+// === Explicit OPTIONS handler + debug logging (paste after app.options(...))
+app.use((req, res, next) => {
+  // log basic info for debugging preflight / CORS issues
+  console.log(`REQ: ${new Date().toISOString()} ${req.method} ${req.originalUrl} Origin=${req.headers.origin || ''}`);
+  next();
+});
+
+// Explicit preflight responder (defensive; ensures headers are returned)
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    // Set CORS response headers explicitly (mirrors corsOptions)
+    const origin = req.headers.origin;
+    if (!origin) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    } else {
+      // allow only configured origins (keep same logic as corsOptions)
+      const allowed = (process.env.FRONTEND_ORIGIN === '*')
+        ? true
+        : (process.env.FRONTEND_ORIGIN || 'http://localhost:5173').split(',').map(s => s.trim()).includes(origin);
+      if (allowed) res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Service-Key,x-service-key');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    // arbitrary small body, but 204 is ideal
+    return res.status(204).send('');
+  }
+  next();
+});
+
 // Ensure preflight (OPTIONS) returns proper headers
 app.options('*', cors(corsOptions));
 
