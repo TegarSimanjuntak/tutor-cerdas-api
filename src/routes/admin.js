@@ -3,7 +3,8 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const { supabaseAdmin } = require('../lib/supabaseClient');
-const fetch = require('node-fetch');
+const { fetch } = require('../lib/fetcher');
+
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const RAG_WORKER_URL = process.env.RAG_WORKER_URL;
