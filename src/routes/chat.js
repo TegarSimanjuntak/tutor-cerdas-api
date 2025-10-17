@@ -12,9 +12,91 @@ if (!RAG_WORKER_URL) {
 }
 
 /**
+ * Simple in-memory translate cache (keyed by text). Replace with Redis for production.
+ */
+const translateCache = new Map();
+const TRANSLATE_CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+
+function cacheSetTranslate(key, value) {
+  translateCache.set(key, { value, ts: Date.now() });
+}
+function cacheGetTranslate(key) {
+  const entry = translateCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > TRANSLATE_CACHE_TTL_MS) {
+    translateCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+/**
+ * Lightweight heuristic to decide if text is likely Indonesian.
+ * Checks presence of common Indonesian function words. It's not perfect,
+ * but avoids calling translation for short English queries.
+ */
+function isLikelyIndonesian(text) {
+  if (!text || typeof text !== 'string') return false;
+  const lowered = text.toLowerCase();
+  // common Indonesian words
+  const commonId = [' dan ', ' yang ', ' untuk ', ' apa ', ' siapa ', ' kapan ', ' mengapa ', ' bagaimana ', ' ini ', ' itu ', ' solusi ', ' contoh ', ' apakah '];
+  for (const w of commonId) {
+    if (lowered.includes(w)) return true;
+  }
+  // if text contains characters outside ASCII (rare for Indonesian) treat as Indonesian
+  // but since Indonesian is ASCII too, this is just a tiny heuristic; main thing is common words above.
+  return false;
+}
+
+/**
+ * translateToEnglish:
+ * - Uses your existing generateText (Gemini wrapper) to get a clean English translation.
+ * - Keeps code/library names and proper nouns unchanged by asking Gemini to not alter them.
+ * - Caches results in-memory.
+ */
+async function translateToEnglish(text) {
+  if (!text || typeof text !== 'string') return '';
+
+  const cacheKey = `t:en:${text}`;
+  const cached = cacheGetTranslate(cacheKey);
+  if (cached) return cached;
+
+  // Build a strict translation prompt for Gemini.
+  const prompt = `Translate the following Indonesian text to fluent, idiomatic English.\n` +
+    `Keep code snippets, library names, technical terms, and proper nouns exactly as they are (do not translate them). ` +
+    `Provide only the translated text (no commentary, no extra notes).\n\nIndonesian:\n${text}\n\nEnglish:`;
+
+  try {
+    // low temperature for deterministic translation
+    const resp = await generateText(prompt, { temperature: 0.0, maxTokens: 512 });
+    let translated = '';
+    if (typeof resp === 'string') {
+      translated = resp.trim();
+    } else if (resp && typeof resp === 'object') {
+      // if your generateText wrapper returns structured object sometimes
+      translated = JSON.stringify(resp).trim();
+    } else {
+      translated = String(resp || '').trim();
+    }
+
+    if (translated) {
+      cacheSetTranslate(cacheKey, translated);
+      return translated;
+    } else {
+      // fallback: return original text if translation blank
+      return text;
+    }
+  } catch (e) {
+    console.warn('translateToEnglish failed:', e && e.message ? e.message : e);
+    // fallback: return original text to avoid breaking retrieval flow
+    return text;
+  }
+}
+
+/**
  * POST /api/chat
  * body: { question, chat_id (optional), filter_document (optional) }
- * Header: Authorization: Bearer <supabase_access_token>  (frontend should forward session access token)
+ * Header: Authorization: Bearer <supabase_access_token>
  */
 router.post('/', async (req, res) => {
   try {
@@ -22,15 +104,35 @@ router.post('/', async (req, res) => {
     const { question, chat_id, filter_document } = req.body;
     if (!question) return res.status(400).json({ error: 'question required' });
 
+    // -------------------------------
+    // 0) Determine query to send to RAG worker
+    //    - If question likely Indonesian, translate to English first.
+    //    - Otherwise, send question as-is.
+    // -------------------------------
+    let queryForSearch = question;
+    try {
+      if (isLikelyIndonesian(question)) {
+        // translate only when heuristic says likely Indonesian
+        queryForSearch = await translateToEnglish(question);
+      } else {
+        // not clearly Indonesian -> send as-is (assume English or short phrase)
+        queryForSearch = question;
+      }
+    } catch (e) {
+      console.warn('Translation step failed, proceeding with original question for retrieval. Error:', (e && e.message) || e);
+      queryForSearch = question;
+    }
+
     // 1) call RAG worker for top-k chunks (if configured)
     let chunks = [];
     if (RAG_WORKER_URL) {
       try {
         const searchUrl = `${RAG_WORKER_URL.replace(/\/+$/,'')}/search`;
+        // send the translated (or original) query for retrieval/embedding
         const searchResp = await fetch(searchUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-SERVICE-KEY': process.env.WORKER_SERVICE_KEY || '' },
-          body: JSON.stringify({ query: question, k: 6, filter_document })
+          body: JSON.stringify({ query: queryForSearch, k: 2, filter_document })
         });
 
         if (!searchResp.ok) {
@@ -80,7 +182,7 @@ router.post('/', async (req, res) => {
     const out_of_context = chunks.length === 0 || topSim < SIMILARITY_THRESHOLD;
     const has_context = !out_of_context; // true if we have at least one chunk with sim >= threshold
 
-    // 2) build prompt
+    // 2) build prompt (IMPORTANT: prompt still uses original `question` in Indonesian)
     const systemPrompt =
       "Kamu adalah tutor cerdas dan sopan yang menjawab dalam Bahasa Indonesia. Gunakan materi yang relevan dari konteks yang disediakan. Jika pertanyaan di luar konteks materi, awali jawaban dengan 'Catatan: pertanyaan ini berada di luar cakupan materi. Jawaban berikut dibuat menggunakan model generatif.'";
 
