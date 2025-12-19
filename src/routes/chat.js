@@ -2,7 +2,9 @@
 const express = require('express');
 const router = express.Router();
 const { supabaseAdmin } = require('../lib/supabaseClient');
-const { generateText } = require('../lib/gemini');
+// const { generateText } = require('../lib/gemini');
+const { generateText } = require('../lib/deepseek');
+
 const { fetch } = require('../lib/fetcher');
 
 const RAG_WORKER_URL = process.env.RAG_WORKER_URL; // e.g., http://localhost:8000 or https://tutor-rag-worker.railway.app
@@ -183,8 +185,12 @@ router.post('/', async (req, res) => {
     const has_context = !out_of_context; // true if we have at least one chunk with sim >= threshold
 
     // 2) build prompt (IMPORTANT: prompt still uses original `question` in Indonesian)
-    const systemPrompt =
-      "Kamu adalah tutor cerdas dan sopan yang menjawab dalam Bahasa Indonesia. Gunakan materi yang relevan dari konteks yang disediakan. Jika pertanyaan di luar konteks materi, awali jawaban dengan 'Catatan: pertanyaan ini berada di luar cakupan materi. Jawaban berikut dibuat menggunakan model generatif.'";
+    const systemPrompt =`Kamu adalah tutor akademik yang menjawab secara jelas, lengkap, dan terstruktur dalam Bahasa Indonesia.
+                        Gunakan informasi dari konteks yang disediakan sebagai sumber utama jawaban.
+                        Jangan memotong jawaban di tengah poin.
+                        Jika pertanyaan memiliki lebih dari satu aspek, semua aspek WAJIB dijawab.
+                        Jika informasi tidak ditemukan dalam konteks, nyatakan secara eksplisit bahwa informasi tersebut tidak ditemukan dalam dokumen.
+                        `;
 
     // Only include context when has_context === true
     let contextText = '';
