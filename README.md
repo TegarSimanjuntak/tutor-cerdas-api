@@ -152,6 +152,19 @@ npm start
 
 *Repositori ini dikembangkan sebagai bagian dari tugas akhir (Skripsi) tahun 2026*.
 
+
+---
+
+## 👤 Dosen Pembimbing
+
+**Dr. Afrida Helen, S.T., M.Kom.**
+
+*
+
+**Dr. Intan Nurma Yulita, S.T., M.T**
+
+* 
+
 ---
 
 **Tautan Terkait:**
@@ -162,7 +175,5 @@ npm start
 
 * 
 [Indexer RAG Service](https://github.com/TegarSimanjuntak/indexer.git).
-
-
 
 ---
